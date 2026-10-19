@@ -1,0 +1,271 @@
+name: Build APK
+on: [workflow_dispatch, push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Create project files
+        run: |
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'PPEOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.playping"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.playping"; minSdk = 24; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          PPEOF
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'PPEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <queries>
+                  <intent><action android:name="android.intent.action.MAIN"/>
+                      <category android:name="android.intent.category.LAUNCHER"/></intent>
+              </queries>
+              <application android:label="Play Ping VPN" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".NetCutService" android:exported="false"
+                      android:permission="android.permission.BIND_VPN_SERVICE">
+                      <intent-filter><action android:name="android.net.VpnService"/></intent-filter>
+                  </service>
+                  <service android:name=".FloatingService" android:exported="false"/>
+              </application>
+          </manifest>
+          PPEOF
+          mkdir -p $(dirname app/src/main/java/com/playping/FloatingService.kt)
+          cat > app/src/main/java/com/playping/FloatingService.kt <<'PPEOF'
+          package com.playping
+          
+          import android.app.Service
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.view.*
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          
+          class FloatingService : Service() {
+              private lateinit var wm: WindowManager
+              private lateinit var btn: TextView
+              private var panel: View? = null
+              private var pkg: String? = null
+              private var cutSeconds = 5
+              private var cutting = false
+              private val h = Handler(Looper.getMainLooper())
+              private var left = 0
+              private val tick = object : Runnable {
+                  override fun run() {
+                      left--
+                      if (left <= 0) setCut(false) else { btn.text = left.toString(); h.postDelayed(this, 1000) }
+                  }
+              }
+          
+              override fun onBind(i: Intent?): IBinder? = null
+          
+              override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+                  pkg = i?.getStringExtra("pkg")
+                  if (!::btn.isInitialized) createButton()
+                  return START_STICKY
+              }
+          
+              private fun lp() = WindowManager.LayoutParams(
+                  WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                  WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
+              ).apply { gravity = Gravity.TOP or Gravity.START; x = 20; y = 300 }
+          
+              private fun createButton() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  btn = TextView(this).apply {
+                      text = "NET"; setTextColor(Color.WHITE); gravity = Gravity.CENTER; textSize = 12f
+                      width = 150; height = 150; background = circle(Color.parseColor("#2E7D32"))
+                  }
+                  val params = lp()
+                  var sx = 0; var sy = 0; var tx = 0f; var ty = 0f; var moved = false
+                  val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+                      override fun onSingleTapUp(e: MotionEvent): Boolean { setCut(!cutting, auto = true); return true }
+                      override fun onLongPress(e: MotionEvent) { if (!moved) showPanel() }
+                  })
+                  btn.setOnTouchListener { _, e ->
+                      gd.onTouchEvent(e)
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { sx = params.x; sy = params.y; tx = e.rawX; ty = e.rawY; moved = false }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = (e.rawX - tx).toInt(); val dy = (e.rawY - ty).toInt()
+                              if (Math.abs(dx) > 10 || Math.abs(dy) > 10) moved = true
+                              if (moved) { params.x = sx + dx; params.y = sy + dy; wm.updateViewLayout(btn, params) }
+                          }
+                      }
+                      true
+                  }
+                  wm.addView(btn, params)
+              }
+          
+              private fun circle(c: Int) = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(c) }
+          
+              private fun setCut(on: Boolean, auto: Boolean = false) {
+                  cutting = on
+                  h.removeCallbacks(tick)
+                  startService(Intent(this, NetCutService::class.java).setAction(if (on) "CUT" else "RESTORE").putExtra("pkg", pkg))
+                  btn.background = circle(Color.parseColor(if (on) "#C62828" else "#2E7D32"))
+                  btn.textSize = if (on) 22f else 12f
+                  if (on && auto) { left = cutSeconds; btn.text = left.toString(); h.postDelayed(tick, 1000) }
+                  else btn.text = if (on) "OFF" else "NET"
+              }
+          
+              private fun showPanel() {
+                  closePanel()
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.parseColor("#E6222222")); setPadding(24, 24, 24, 24)
+                      addView(TextView(context).apply { text = "قطع النت لمدة:"; setTextColor(Color.WHITE) })
+                      for (s in listOf(3, 5, 10, 15, 30, 60)) addView(Button(context).apply {
+                          text = "$s ثانية"; setOnClickListener { cutSeconds = s; closePanel() }
+                      })
+                      addView(Button(context).apply { text = "إغلاق الزر"; setOnClickListener { closePanel(); stopSelf() } })
+                  }
+                  val p = lp().apply { gravity = Gravity.CENTER; flags = 0 }
+                  panel = box; wm.addView(box, p)
+              }
+          
+              private fun closePanel() { panel?.let { wm.removeView(it) }; panel = null }
+          
+              override fun onDestroy() {
+                  h.removeCallbacks(tick); closePanel()
+                  if (::btn.isInitialized) wm.removeView(btn)
+                  startService(Intent(this, NetCutService::class.java).setAction("RESTORE"))
+                  super.onDestroy()
+              }
+          }
+          PPEOF
+          mkdir -p $(dirname app/src/main/java/com/playping/MainActivity.kt)
+          cat > app/src/main/java/com/playping/MainActivity.kt <<'PPEOF'
+          package com.playping
+          
+          import android.content.Intent
+          import android.net.Uri
+          import android.net.VpnService
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.*
+          
+          class MainActivity : android.app.Activity() {
+              private lateinit var apps: List<Pair<String, String>> // label to package
+              private lateinit var spinner: Spinner
+          
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val pm = packageManager
+                  apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                      .map { it.loadLabel(pm).toString() to it.activityInfo.packageName }
+                      .filter { it.second != packageName }.sortedBy { it.first.lowercase() }
+          
+                  spinner = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, apps.map { it.first })
+                  }
+                  val start = Button(this).apply { text = "ابدأ"; setOnClickListener { begin() } }
+                  setContentView(LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48)
+                      addView(TextView(context).apply { text = "Play Ping VPN"; textSize = 26f })
+                      addView(TextView(context).apply { text = "اختر التطبيق / اللعبة:" })
+                      addView(spinner); addView(start)
+                  })
+              }
+          
+              private fun begin() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      Toast.makeText(this, "فعّل إذن الظهور فوق التطبيقات ثم اضغط ابدأ", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  val vpn = VpnService.prepare(this)
+                  if (vpn != null) { startActivityForResult(vpn, 1); return }
+                  launch()
+              }
+          
+              override fun onActivityResult(r: Int, c: Int, d: Intent?) { if (r == 1 && c == RESULT_OK) launch() }
+          
+              private fun launch() {
+                  val pkg = apps[spinner.selectedItemPosition].second
+                  startService(Intent(this, FloatingService::class.java).putExtra("pkg", pkg))
+                  packageManager.getLaunchIntentForPackage(pkg)?.let { startActivity(it) }
+              }
+          }
+          PPEOF
+          mkdir -p $(dirname app/src/main/java/com/playping/NetCutService.kt)
+          cat > app/src/main/java/com/playping/NetCutService.kt <<'PPEOF'
+          package com.playping
+          
+          import android.content.Intent
+          import android.net.VpnService
+          import android.os.ParcelFileDescriptor
+          
+          /** Blackhole VPN: while active, traffic of the chosen app goes into a tunnel nobody reads => no internet for it. */
+          class NetCutService : VpnService() {
+              private var tun: ParcelFileDescriptor? = null
+          
+              override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+                  when (i?.action) {
+                      "CUT" -> cut(i.getStringExtra("pkg"))
+                      "RESTORE" -> restore()
+                  }
+                  return START_STICKY
+              }
+          
+              private fun cut(pkg: String?) {
+                  if (tun != null) return
+                  val b = Builder().setSession("PlayPing")
+                      .addAddress("10.77.0.2", 32).addRoute("0.0.0.0", 0)
+                      .addAddress("fd00:77::2", 128).addRoute("::", 0)
+                  if (pkg != null) b.addAllowedApplication(pkg)
+                  tun = b.establish()
+              }
+          
+              private fun restore() { tun?.close(); tun = null }
+              override fun onRevoke() { restore() }
+              override fun onDestroy() { restore(); super.onDestroy() }
+          }
+          PPEOF
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'PPEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          PPEOF
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'PPEOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "PlayPing"
+          include(":app")
+          PPEOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PlayPing-APK
+          path: app/build/outputs/apk/debug/*.apk
